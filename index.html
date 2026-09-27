@@ -904,7 +904,7 @@
     window.addEventListener('online', actualizarEstadoRed);
     window.addEventListener('offline', actualizarEstadoRed);
 
-    // Reloj que comprueba si hiciste cambios en Google Sheets cada 20 segundos
+    // Consulta periódica a Google Sheets cada 20 segundos
     setInterval(function() {
         if (navigator.onLine && GOOGLE_SCRIPT_URL) {
             sincronizarSilenciosoDesdeGoogleSheets();
@@ -966,21 +966,58 @@
         actualizarEstadoRed();
     }
 
+    /* AUTO-SINCRONIZACIÓN AL ABRIR LA PÁGINA */
+    async function autoSincronizarAlIniciar() {
+        if (!GOOGLE_SCRIPT_URL || !navigator.onLine) return;
+
+        const stText = document.getElementById('status-text');
+        if (stText) stText.innerText = "⏳ Verificando datos con Google Sheets...";
+
+        try {
+            const resp = await fetch(`${GOOGLE_SCRIPT_URL}?tabla=Miembros`);
+            const datos = await resp.json();
+
+            // CASO A: Google Sheets ya tiene miembros cargados -> Se importan de inmediato
+            if (Array.isArray(datos) && datos.length > 0) {
+                BD_MIEMBROS = datos.map(m => ({
+                    id: m.id || Date.now(),
+                    nombres: m.nombres || m.Nombre || "",
+                    apellidos: m.apellidos || m.Apellidos || "",
+                    phone: (m.phone || m.whatsapp || m.WhatsApp || m.telefono || "").toString().trim(),
+                    fecha_nacimiento: m.fecha_nacimiento || m.fecha_nac || "",
+                    esBautizado: (m.esBautizado === "SI" || m.esBautizado === true || m.esBautizado === "true"),
+                    fechaBautismo: m.fechaBautismo || m.fecha_bautismo || "",
+                    activo: (m.activo === "TRUE" || m.activo === true || m.activo === "true" || m.activo === "ACTIVO"),
+                    foto: m.foto || ""
+                }));
+
+                localStorage.setItem('bd_miembros', JSON.stringify(BD_MIEMBROS));
+                renderMiembros();
+                renderCajaSidePermanente();
+                if (stText) stText.innerText = "🟢 Conectado y Sincronizado con Google Sheets";
+            } 
+            // CASO B: Google Sheets está vacío pero la web tiene datos locales -> Se suben a Sheets en filas desglosadas
+            else if (BD_MIEMBROS.length > 0) {
+                if (stText) stText.innerText = "⬆️ Google Sheets está vacío. Sincronizando datos locales...";
+                await exportarTodoAGoogleSheets();
+            }
+        } catch (err) {
+            console.log("Servidor en espera de primera consulta.");
+        }
+    }
+
     async function exportarTodoAGoogleSheets() {
         if (!GOOGLE_SCRIPT_URL) return alert("⚠️ No se ha configurado la URL de Google Apps Script.");
-        if (!navigator.onLine) return alert("⚠️ Se requiere conexión a Internet para subir los datos a Google Sheets.");
-
-        if (!confirm("¿Deseas enviar toda tu base de datos actual hacia Google Sheets? Este proceso actualizará tus hojas con tu información.")) {
-            return;
-        }
+        if (!navigator.onLine) return alert("⚠️ Se requiere conexión a Internet.");
 
         const badge = document.getElementById('badge-red-status');
         const stText = document.getElementById('status-text');
-        if(badge) {
+        if (badge) {
             badge.className = "status-pill status-syncing";
-            badge.innerText = "🟠 SUBIENDO DATOS...";
+            badge.innerText = "🟠 CREANDO TABLAS EN SHEETS...";
         }
 
+        // 1. Desglose de Miembros
         const miembrosEstructurados = BD_MIEMBROS.map(m => {
             let fotoURL = m.foto || "";
             if (fotoURL.startsWith("data:image")) fotoURL = "FOTO_LOCAL_OMITIDA";
@@ -997,20 +1034,105 @@
             };
         });
 
+        // 2. Desglose de Calendarios
+        let calendariosFilas = [];
+        Object.keys(BD_CALENDARIOS_TRIM).forEach(trim => {
+            const sabs = BD_CALENDARIOS_TRIM[trim] || [];
+            sabs.forEach(s => {
+                calendariosFilas.push({
+                    trimestre: trim,
+                    sabado_num: s.num,
+                    fecha: s.fecha,
+                    cancelado: s.cancelado ? "SI" : "NO",
+                    motivo: s.motivo || "",
+                    gpPrograma: s.gpPrograma || "",
+                    repasoLeccion: s.repasoLeccion || "",
+                    tituloEscuela: s.tituloEscuela || "",
+                    dptoOrganiza: s.dptoOrganiza || ""
+                });
+            });
+        });
+
+        // 3. Desglose de Grupos Pequeños
+        let gruposFilas = [];
+        Object.keys(BD_GRUPOS_TRIM).forEach(trim => {
+            const gps = BD_GRUPOS_TRIM[trim] || [];
+            gps.forEach(g => {
+                gruposFilas.push({
+                    trimestre: trim,
+                    grupo_id: g.id,
+                    nombre: g.nombre,
+                    clasificacion: g.clasificacion,
+                    logo: g.logo || ""
+                });
+            });
+        });
+
+        // 4. Desglose de Estructuras GP
+        let estructurasFilas = [];
+        Object.keys(BD_ESTRUCTURAS_TRIM).forEach(trim => {
+            const dict = BD_ESTRUCTURAS_TRIM[trim] || {};
+            Object.keys(dict).forEach(gpId => {
+                const integrantes = dict[gpId] || [];
+                integrantes.forEach(i => {
+                    estructurasFilas.push({
+                        trimestre: trim,
+                        grupo_id: gpId,
+                        posicion: i.posicion || i.pos,
+                        miembroId: i.miembroId,
+                        rol: i.rol || ""
+                    });
+                });
+            });
+        });
+
+        // 5. Desglose de Pase de Lista
+        let registrosFilas = Object.keys(BD_REGISTROS).map(k => {
+            const r = BD_REGISTROS[k];
+            const partes = k.split('_');
+            return {
+                registro_key: k,
+                trimestre: partes[0] || "",
+                sabado: partes[1] || "",
+                miembroId: r.miembroId || partes[2] || "",
+                asistencia: r.asis ? "TRUE" : "FALSE",
+                estudio_diario: r.estDia || 0,
+                estudios_biblicos: r.estB || 0,
+                contactos_misioneros: r.contM || 0
+            };
+        });
+
+        // 6. Desglose de Reuniones de Grupos Pequeños
+        let reunionesFilas = Object.keys(BD_GP_REUNIONES).map(k => {
+            const r = BD_GP_REUNIONES[k];
+            const partes = k.split('_');
+            return {
+                reunion_key: k,
+                trimestre: partes[0] || "",
+                sabado: partes[1] || "",
+                grupo_id: partes[2] || "",
+                se_reunio: r.reunido ? "SI" : "NO",
+                miembros_presentes: r.mPresentes || 0,
+                visitas_gp: r.visitas || 0,
+                visitas_es: r.visitasES || 0,
+                ofrenda_monto: r.ofrenda || "0.00"
+            };
+        });
+
         const paquetes = [
             { tabla: "Iglesia", datos: BD_CHURCH },
             { tabla: "Miembros", datos: miembrosEstructurados },
-            { tabla: "Grupos", datos: BD_GRUPOS_TRIM },
-            { tabla: "Estructuras_GP", datos: BD_ESTRUCTURAS_TRIM },
-            { tabla: "Calendarios", datos: BD_CALENDARIOS_TRIM },
-            { tabla: "Pase_De_Lista", datos: BD_REGISTROS },
-            { tabla: "Reuniones_GP", datos: BD_GP_REUNIONES },
+            { tabla: "Grupos", datos: gruposFilas },
+            { tabla: "Estructuras_GP", datos: estructurasFilas },
+            { tabla: "Calendarios", datos: calendariosFilas },
+            { tabla: "Pase_De_Lista", datos: registrosFilas },
+            { tabla: "Reuniones_GP", datos: reunionesFilas },
             { tabla: "Cursos_Catalogo", datos: BD_CURSOS_CATALOGO },
             { tabla: "Estudios_Biblicos", datos: BD_ESTUDIOS_BIBLICOS }
         ];
 
         for (let p of paquetes) {
-            if(stText) stText.innerText = `Subiendo tabla: ${p.tabla}...`;
+            if (stText) stText.innerText = `Subiendo celda por celda: ${p.tabla}...`;
             try {
                 await fetch(GOOGLE_SCRIPT_URL, {
                     method: 'POST',
@@ -1024,7 +1146,6 @@
         }
 
         actualizarEstadoRed();
-        alert("🎉 ¡Toda la información se ha enviado con éxito a tu Hoja de Google Sheets!");
     }
 
     function guardarUrlGoogleScript() {
@@ -1032,6 +1153,7 @@
         localStorage.setItem('google_script_url', url);
         GOOGLE_SCRIPT_URL = url;
         alert("🎉 URL de Google Script guardada.");
+        autoSincronizarAlIniciar();
     }
 
     async function sincronizarSilenciosoDesdeGoogleSheets() {
@@ -1109,7 +1231,7 @@
                 localStorage.setItem('bd_miembros', JSON.stringify(BD_MIEMBROS));
                 renderMiembros();
                 renderCajaSidePermanente();
-                alert("🎉 Sincronización exitosa. Se descargaron los datos actualizados desde Google Sheets.");
+                alert("🎉 Sincronización exitosa. Datos descargados desde Google Sheets.");
             } else {
                 alert("ℹ️ No se encontraron miembros en la hoja.");
             }
@@ -1943,7 +2065,7 @@
         reader.readAsText(file);
     }
 
-    /* INICIALIZACIÓN GLOBAL */
+    /* INICIALIZACIÓN GLOBAL CON AUTO-SINCRONIZACIÓN EN SEGUNDO PLANO */
     window.onload = function() {
         actualizarEtiquetasTrimestreNav();
         renderIglesiaUI(); 
@@ -1956,6 +2078,7 @@
         calcularYClasificarEdades();
         if(document.getElementById('script_url_input')) document.getElementById('script_url_input').value = GOOGLE_SCRIPT_URL;
         actualizarEstadoRed();
+        autoSincronizarAlIniciar();
     }
 
     function renderIglesiaUI() { 
